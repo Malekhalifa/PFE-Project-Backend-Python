@@ -6,8 +6,20 @@ import io
 import math
 import uuid
 from typing import Dict, List, Any
-
+from db import connect, disconnect
+from log import log_file_upload
+import json
+import os
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def startup():
+    await connect()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await disconnect()
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,25 +34,24 @@ jobs: Dict[str, str] = {}  # job_id -> status
 uploaded_files: Dict[str, bytes] = {}  # job_id -> raw CSV bytes
 results_store: Dict[str, Dict[str, Any]] = {}  # job_id -> analysis result
 
-
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    """
-    Receive a CSV file and return a job_id to be used for analysis.
-    The file content is kept in memory for this demo, and duplicates
-    are NOT removed here so we can measure them accurately in analysis.
-    """
-    if file.content_type not in ["text/csv", "application/vnd.ms-excel"]:
-        # basic content-type check; still try to read as CSV later
-        ...
-## step 1: read the file and store it in the memory
-    # Read raw file content and store as-is (including duplicates)
     content = await file.read()
 
+    file_name = file.filename
+    extension = os.path.splitext(file_name)[1].lstrip(".").lower() or "unknown"
+    file_size = len(content)
+
+    await log_file_upload(
+        user_name="anonymous",
+        action="upload_file",
+        file_name=file_name,
+        extension=extension,
+        file_size=file_size,
+    )
     job_id = str(uuid.uuid4())
     uploaded_files[job_id] = content
     jobs[job_id] = "starting"
-
     return {"job_id": job_id}
 
 
