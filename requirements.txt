@@ -3,3 +3,5 @@ uvicorn
 databases[postgresql]
 asyncpg
 python-dotenv
+pandas
+scikit-learn

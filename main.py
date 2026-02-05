@@ -1,15 +1,17 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
-import csv
 import io
-import math
 import uuid
-from typing import Dict, List, Any
+import os
+from typing import Dict, Any
+
 from db import connect, disconnect
 from log import log_file_upload
-import json
-import os
+
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+
 app = FastAPI()
 
 
@@ -17,9 +19,11 @@ app = FastAPI()
 async def startup():
     await connect()
 
+
 @app.on_event("shutdown")
 async def shutdown():
     await disconnect()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,10 +33,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In‑memory storage for uploaded files and job results
-jobs: Dict[str, str] = {}  # job_id -> status
-uploaded_files: Dict[str, bytes] = {}  # job_id -> raw CSV bytes
-results_store: Dict[str, Dict[str, Any]] = {}  # job_id -> analysis result
+# In-memory state (unchanged)
+jobs: Dict[str, str] = {}
+uploaded_files: Dict[str, bytes] = {}
+results_store: Dict[str, Dict[str, Any]] = {}
+
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
@@ -49,182 +54,132 @@ async def upload(file: UploadFile = File(...)):
         extension=extension,
         file_size=file_size,
     )
+
     job_id = str(uuid.uuid4())
     uploaded_files[job_id] = content
     jobs[job_id] = "starting"
+
     return {"job_id": job_id}
 
 
+def _is_valid_email_series(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    return (
+        s.str.contains("@", regex=False)
+        & s.str.split("@").str.len().eq(2)
+        & s.str.split("@").str[1].str.contains(".", regex=False)
+    )
 
-def _parse_csv(content: bytes) -> List[List[str]]:
-    text = content.decode("utf-8", errors="replace")
-    reader = csv.reader(io.StringIO(text))
-    rows: List[List[str]] = [row for row in reader]
-    return rows
+def load_dataframe(content: bytes) -> pd.DataFrame:
+    try:
+        return pd.read_csv(io.BytesIO(content))
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
+def compute_basic_quality(df: pd.DataFrame) -> tuple[float, float, int]:
+    rows, cols = df.shape
+    total = rows * cols
 
-def _is_missing(value: str) -> bool:
-    v = value.strip()
-    return v == "" or v.lower() in {"na", "null", "none", "nan"}
+    missing_rate = df.isna().sum().sum() / total if total else 0.0
+    duplicate_count = int(df.duplicated().sum())
+    duplicate_rate = duplicate_count / rows if rows else 0.0
 
+    return missing_rate, duplicate_rate, duplicate_count
 
-def _is_valid_email(value: str) -> bool:
-    """
-    Very simple email heuristic:
-    - must contain exactly one "@"
-    - must have at least one "." in the domain part
-    """
-    value = value.strip()
-    if "@" not in value:
-        return False
-    local, _, domain = value.partition("@")
-    if not local or not domain:
-        return False
-    return "." in domain
+def compute_type_consistency(df: pd.DataFrame) -> tuple[dict, dict, pd.DataFrame]:
+    numeric_df = df.apply(pd.to_numeric, errors="coerce")
 
+    type_consistency = {}
+    email_validity = {}
 
-def _compute_outliers(numeric_columns: List[List[float]]) -> int:
-    """
-    Very simple outlier detection:
-    A value is an outlier if it's more than 3 standard deviations from
-    the mean of its column.
-    """
-    outliers = 0
-    for col in numeric_columns:
-        if len(col) < 2:
-            continue
-        mean = sum(col) / len(col)
-        var = sum((x - mean) ** 2 for x in col) / (len(col) - 1)
-        std = math.sqrt(var) if var > 0 else 0.0
-        if std == 0:
-            continue
-        for x in col:
-            if abs(x - mean) > 3 * std:
-                outliers += 1
-    return outliers
+    rows = len(df)
 
+    for col in df.columns:
+        col_series = df[col]
+        numeric_series = numeric_df[col]
+
+        missing = int(col_series.isna().sum())
+        numeric = int(numeric_series.notna().sum())
+        non_numeric = rows - numeric - missing
+
+        type_consistency[col] = {
+            "numeric": numeric,
+            "non_numeric": non_numeric,
+            "missing": missing,
+            "valid": 0,
+            "invalid": 0,
+            "total": numeric + non_numeric,
+        }
+
+        if "email" in col.lower():
+            valid_mask = _is_valid_email_series(col_series.dropna())
+            valid = int(valid_mask.sum())
+            invalid = int((~valid_mask).sum())
+            email_validity[col] = {
+                "valid": valid,
+                "invalid": invalid,
+                "total": valid + invalid,
+            }
+            type_consistency[col]["valid"] = valid
+            type_consistency[col]["invalid"] = invalid
+
+    return type_consistency, email_validity, numeric_df
+
+def compute_outlier_rate(numeric_df: pd.DataFrame) -> float:
+    numeric_only = numeric_df.dropna(axis=1, how="all")
+
+    if numeric_only.shape[0] <= 10 or numeric_only.shape[1] == 0:
+        return 0.0
+
+    filled = numeric_only.fillna(numeric_only.mean())
+    if filled.shape[1] > 50:
+        filled = filled.iloc[:, :50]
+
+    iso = IsolationForest(n_estimators=100, contamination="auto", random_state=42)
+    preds = iso.fit_predict(filled)
+
+    return (preds == -1).sum() / filled.shape[0]
+
+def compute_column_stats(df: pd.DataFrame, numeric_df: pd.DataFrame) -> tuple[dict, dict]:
+    rows = len(df)
+
+    uniqueness = {
+        col: df[col].nunique(dropna=False) / rows if rows else 0.0
+        for col in df.columns
+    }
+
+    numeric_stats = {}
+    for col in df.columns:
+        col_num = numeric_df[col].dropna()
+        numeric_stats[col] = {} if col_num.empty else {
+            "min": float(col_num.min()),
+            "max": float(col_num.max()),
+            "mean": float(col_num.mean()),
+        }
+
+    return uniqueness, numeric_stats
 
 def analyze_csv(content: bytes) -> Dict[str, Any]:
-    rows = _parse_csv(content)
-    if not rows:
+    df = load_dataframe(content)
+
+    if df.empty:
         return {
             "cleaned_data": {"rows": 0, "columns": 0},
             "quality_report": {},
         }
 
-    header = rows[0]
-    data_rows = rows[1:] if len(rows) > 1 else []
+    rows, cols = df.shape
 
-    num_rows = len(data_rows)
-    num_cols = len(header)
+    missing_rate, duplicate_rate, duplicate_count = compute_basic_quality(df)
+    type_consistency, email_validity, numeric_df = compute_type_consistency(df)
+    outlier_rate = compute_outlier_rate(numeric_df)
+    uniqueness, numeric_stats = compute_column_stats(df, numeric_df)
 
-    # --- Missing values ---
-    total_cells = num_rows * num_cols if num_rows > 0 else 0
-    missing_count = 0
-    for row in data_rows:
-        for cell in row:
-            if _is_missing(cell):
-                missing_count += 1
-    missing_rate = missing_count / total_cells if total_cells > 0 else 0.0
-
-    # --- Duplicate rows ---
-    row_tuples = [tuple(r) for r in data_rows]
-    unique_rows = set(row_tuples)
-    duplicate_count = len(row_tuples) - len(unique_rows)
-    duplicate_rate = duplicate_count / num_rows if num_rows > 0 else 0.0
-
-    # --- Numeric processing & type consistency ---
-    numeric_columns: List[List[float]] = [[] for _ in range(num_cols)]
-    type_consistency: Dict[str, Dict[str, int]] = {}
-    email_validity: Dict[str, Dict[str, int]] = {}
-    for idx, col_name in enumerate(header):
-        # Base counters for every column
-        type_consistency[col_name] = {
-            "numeric": 0,
-            "non_numeric": 0,
-            "missing": 0,
-            "valid": 0,
-            "invalid": 0,
-            "total": 0,
-        }
-        # Track which columns we consider "email-like"
-        if "email" in col_name.lower():
-            email_validity[col_name] = {"valid": 0, "invalid": 0, "total": 0}
-
-    for row in data_rows:
-        for idx in range(num_cols):
-            if idx >= len(row):
-                continue
-            cell = row[idx].strip()
-            col_name = header[idx]
-
-            if _is_missing(cell):
-                type_consistency[col_name]["missing"] += 1
-                continue
-
-            # Email validity check for columns that look like emails
-            if col_name in email_validity:
-                email_validity[col_name]["total"] += 1
-                type_consistency[col_name]["total"] += 1
-                if _is_valid_email(cell):
-                    email_validity[col_name]["valid"] += 1
-                    type_consistency[col_name]["valid"] += 1
-                else:
-                    email_validity[col_name]["invalid"] += 1
-                    type_consistency[col_name]["invalid"] += 1
-
-            try:
-                value = float(cell)
-                numeric_columns[idx].append(value)
-                type_consistency[col_name]["numeric"] += 1
-            except ValueError:
-                type_consistency[col_name]["non_numeric"] += 1
-
-    # After scanning all rows, ensure "total" is at least numeric + non_numeric
-    for col_name, counts in type_consistency.items():
-        counts["total"] = max(
-            counts.get("total", 0),
-            counts.get("numeric", 0) + counts.get("non_numeric", 0),
-        )
-
-    # --- Outliers ---
-    outlier_count = _compute_outliers(numeric_columns)
-    numeric_cell_count = sum(len(col) for col in numeric_columns)
-    outlier_rate = (
-        outlier_count / numeric_cell_count if numeric_cell_count > 0 else 0.0
-    )
-
-    # --- Uniqueness per column ---
-    uniqueness: Dict[str, float] = {}
-    for idx, col_name in enumerate(header):
-        col_values = [row[idx] for row in data_rows if idx < len(row)]
-        unique_count = len(set(col_values))
-        uniqueness[col_name] = unique_count / len(col_values) if col_values else 0.0
-
-    # --- Basic stats per numeric column ---
-    numeric_stats: Dict[str, Dict[str, float]] = {}
-    for idx, col_name in enumerate(header):
-        col = numeric_columns[idx]
-        if col:
-            mean = sum(col) / len(col)
-            var = sum((x - mean) ** 2 for x in col) / (len(col) - 1) if len(col) > 1 else 0.0
-            std = math.sqrt(var)
-            numeric_stats[col_name] = {
-                "min": min(col),
-                "max": max(col),
-                "mean": mean,
-            }
-        else:
-            numeric_stats[col_name] = {}
-
-   
-
-    # --- Quality score ---
     penalty = (missing_rate + duplicate_rate + outlier_rate) / 3.0
     quality_score = max(0.0, 1.0 - penalty)
 
     return {
-        "cleaned_data": {"rows": num_rows, "columns": num_cols},
+        "cleaned_data": {"rows": rows, "columns": cols},
         "quality_report": {
             "missing_rate": round(missing_rate, 4),
             "duplicate_rate": round(duplicate_rate, 4),
@@ -238,20 +193,15 @@ def analyze_csv(content: bytes) -> Dict[str, Any]:
         },
     }
 
-
 @app.post("/analyze/{job_id}")
 async def analyze(job_id: str):
-    """
-    Perform deterministic, static analysis on the uploaded CSV for this job.
-    """
     content = uploaded_files.get(job_id)
     if content is None:
         jobs[job_id] = "failed"
         return {"detail": "No uploaded file found for this job."}
 
     jobs[job_id] = "running"
-    result = analyze_csv(content)
-    results_store[job_id] = result
+    results_store[job_id] = analyze_csv(content)
     jobs[job_id] = "completed"
 
     return {"message": "analysis completed"}
@@ -259,8 +209,7 @@ async def analyze(job_id: str):
 
 @app.get("/status/{job_id}")
 async def status(job_id: str):
-    status_value = jobs.get(job_id, "unknown")
-    return {"status": status_value}
+    return {"status": jobs.get(job_id, "unknown")}
 
 
 @app.get("/results/{job_id}")
@@ -273,18 +222,17 @@ async def results(job_id: str):
 
 @app.get("/raw/{job_id}")
 async def raw_data(job_id: str):
-    """
-    Return the cleaned CSV for this job as header + rows
-    so the frontend can render a table matching the CSV format.
-    """
     content = uploaded_files.get(job_id)
     if content is None:
         return {"detail": "No data found for this job."}
 
-    rows = _parse_csv(content)
-    if not rows:
-        return {"header": [], "rows": []}
+    df = pd.read_csv(io.BytesIO(content))
 
-    header = rows[0]
-    data_rows = rows[1:] if len(rows) > 1 else []
-    return {"header": header, "rows": data_rows}
+    # Replace all NaN / Inf with None
+    df = df.replace({pd.NA: None, float("nan"): None, float("inf"): None, float("-inf"): None})
+    df = df.where(pd.notna(df), None)  # extra safety
+
+    return {
+        "header": df.columns.tolist(),
+        "rows": df.values.tolist(),  # NO astype(str)
+    }
