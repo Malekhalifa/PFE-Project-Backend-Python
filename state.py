@@ -6,5 +6,7 @@ jobs: Dict[str, str] = {}
 uploaded_files: Dict[str, str] = {}
 # Optional mode per job, e.g. "normal" or "large" for large-file handling.
 job_modes: Dict[str, str] = {}
+# Per-job analysis metadata for export (started_at, completed_at, duration_ms, analysis_type, etc.).
+analysis_meta: Dict[str, Dict[str, Any]] = {}
 results_store: Dict[str, Dict[str, Any]] = {}
 
